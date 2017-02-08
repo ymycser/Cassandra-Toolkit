@@ -1,0 +1,541 @@
+#!/bin/bash
+# Cassandra operation tool
+# Version=1.0.0
+# Author=ymycser
+# Email=ymycser@gmail.com
+
+CONF_FILE=cassandra.conf
+source "${CONF_FILE}"
+NODE=''
+OPERATION=''
+PID=''
+USER="$(whoami)"
+
+add_node() {
+    check_process
+    if [[ "$?" == 0 ]]; then
+        return 1
+    fi
+
+    confirm_operation "${OPERATION}" "${NODE}"
+
+    if [[ -d "${CASSANDRA_HOME}" && "$(ls -A "${CASSANDRA_HOME}" | wc -l)" > 0 ]]; then
+        confirm_operation 'add_exists' "${NODE}"
+    fi
+
+    local parent_dir
+    parent_dir="${CASSANDRA_HOME%/*}"
+    if [[ ! -d "${parent_dir}" ]]; then
+        sudo mkdir -p "${parent_dir}"
+        if [[ "$?" != 0 ]]; then
+            err "Can not create \033[33${parent_dir}\033[0m."
+            return 1
+        fi
+    fi
+    sudo tar zxf "${INSTALLATION_PACKAGE}" -C "${parent_dir}"
+    if [[ "$?" != 0 ]]; then
+        err "Can not unpack \033[33m${INSTALLATION_PACKAGE}\033[0m to \033[33m${parent_dir}\033[0m."
+        return 1
+    fi
+
+    local last_dir
+    last_dir="${CASSANDRA_HOME##*/}"
+    if [[ "${last_dir}" != "apache-cassandra-${CASSANDRA_VERSION}" ]]; then
+        sudo mv "${parent_dir}/apache-cassandra-${CASSANDRA_VERSION}" "${CASSANDRA_HOME}"
+        if [[ "$?" != 0 ]]; then
+            err "Can not rename \033[33m${parent_dir}/apache-cassandra-${CASSANDRA_VERSION}\033[0m."
+            return 1
+        fi
+    fi
+    sudo chown "${USER}" -R "${CASSANDRA_HOME}"
+    if [[ "$?" != 0 ]]; then
+        err "Can not change owner of \033[33m${CASSANDRA_HOME}\033[0m to \033[33m${USER}\033[0m."
+        return 1
+    fi
+
+    if [[ -n "${CLUSTER_NAME}" && -n "${SEEDS}" ]]; then
+        sudo sed -i "s/^cluster_name:.*/cluster_name: '${CLUSTER_NAME}'/g" "${CASSANDRA_CONF_FILE}" \
+            && sudo sed -i "s/- seeds:.*/- seeds: \"${SEEDS}\"/g" "${CASSANDRA_CONF_FILE}" \
+            && sudo sed -i "s/^listen_address:.*/listen_address: ${NODE}/g" "${CASSANDRA_CONF_FILE}" \
+            && sudo sed -i "s/^rpc_address:.*/rpc_address: ${NODE}/g" "${CASSANDRA_CONF_FILE}" \
+            && sudo sed -i "s/^endpoint_snitch:.*/endpoint_snitch: GossipingPropertyFileSnitch/g" \
+                "${CASSANDRA_CONF_FILE}"
+        if [[ "$?" != 0 ]]; then
+            err "Can not modify \033[33m${CASSANDRA_CONF_FILE}\033[0m."
+            return 1
+        fi
+    else
+        err "Can not modify \033[33m${CASSANDRA_CONF_FILE}\033[0m due to empty cluster_name or seeds."
+        return 1
+    fi
+
+    if [[ -n "${DC}" && -n "${RACK}" ]]; then
+        sudo sed -i "s/^dc=.*/dc=${DC}/g" "${CASSANDRA_RACKDC_CONF_FILE}" \
+            && sudo sed -i "s/^rack=.*/rack=${RACK}/g" "${CASSANDRA_RACKDC_CONF_FILE}" \
+            && sudo sed -i "s/^# prefer_local=.*/prefer_local=true/g" "${CASSANDRA_RACKDC_CONF_FILE}"
+        if [[ "$?" != 0 ]]; then
+            err "Can not modify \033[33m${CASSANDRA_RACKDC_CONF_FILE}\033[0m."
+            return 1
+        fi
+    else
+        err "Can not modify \033[33m${CASSANDRA_RACKDC_CONF_FILE}\033[0m due to empty dc or rack."
+        return 1
+    fi
+
+    start_node
+    return "$?"
+}
+
+backup_data() {
+    check_process
+    if [[ "$?" != 0 ]]; then
+        return 1
+    fi
+
+    OLD_IFS="${IFS}"
+    IFS=','
+    BACKUP_KEYSPACES=(${BACKUP_KEYSPACES})
+    IFS="${OLD_IFS}"
+    local keyspace_data_dir
+    local snapshots_dir
+    snapshots_dir='snapshots'
+    local table
+    local timestamp
+    local backup_data_package
+    for keyspace in ${BACKUP_KEYSPACES[@]}; do
+        cd "${CASSANDRA_BIN}"
+        ./nodetool clearsnapshot "${keyspace}"
+        if [[ "$?" != 0 ]]; then
+            err "Can not clear snapshot of keyspace \033[33m${keyspace}\033[0m."
+            continue
+        fi
+        ./nodetool snapshot "${keyspace}"
+        if [[ "$?" != 0 ]]; then
+            err "Can not make snapshot of keyspace \033[33m${keyspace}\033[0m."
+            continue
+        fi
+
+        keyspace_data_dir="${CASSANDRA_DATA}/data/${keyspace}"
+        cd "${keyspace_data_dir}"
+        for table_data_dir in `ls -F | grep /$`; do
+            cd "${table_data_dir}"
+            if [[ -d "${snapshots_dir}" ]]; then
+                cd "${snapshots_dir}"
+                table="${table_data_dir%-*}"
+
+                for snapshot_dir in `ls -F | grep /$`; do
+                    cd "${snapshot_dir}"
+                    timestamp="${snapshot_dir%/*}"
+                    backup_data_package="${NODE}-${keyspace}-${table}-${timestamp}.tar.gz"
+                    out "Backup ${keyspace}.${table} from node ${NODE} to ${BACKUP_DATA_DIR}/${backup_data_package}."
+                    tar zcf "${BACKUP_DATA_DIR}/${backup_data_package}" *
+                    if [[ "$?" != 0 ]]; then
+                        err "Can not pack \033[33m${BACKUP_DATA_DIR}/${backup_data_package}\033[0m."
+                        ls | grep -v -E '.*\.db|.*\.json|*\.sha1|.*\.txt' | xargs rm -rf
+                        break
+                    fi
+                done
+            fi
+            cd "${keyspace_data_dir}"
+        done
+
+        cd "${CASSANDRA_BIN}"
+        ./nodetool clearsnapshot "${keyspace}"
+        if [[ "$?" != 0 ]]; then
+            err "Can not clear snapshot of keyspace \033[33m${keyspace}\033[0m."
+            continue
+        fi
+    done
+    return 0
+}
+
+check_process() {
+    local process_pid
+    process_pid="$(pgrep -u "${USER}" -f 'CassandraDaemon')"
+    local process_count
+    if [[ -n "${process_pid}" ]]; then
+        process_count="$(echo "${process_pid}" | wc -l)"
+    else
+        process_count=0
+    fi
+
+    if [[ "${process_count}" > 1 ]]; then
+        err 'More than one Cassandra process is running.'
+        PID=''
+        return 1
+    elif [[ "${process_count}" == 1 ]]; then
+        out 'Cassandra is running.'
+        PID="${process_pid}"
+        return 0
+    else
+        out 'Cassandra is not running.'
+        PID=-1
+        return 1
+    fi
+}
+
+check_start() {
+    cd "${CASSANDRA_BIN}"
+    local start_time
+    start_time="$(date -d "$(date +"%Y-%m-%d %H:%M:%S")" +%s)"
+    local filed_pid
+    local start_logs
+    local last_start_time
+    for ((i=0; i<"${START_CHECK_COUNT}"; i++)); do
+        sleep "${START_CHECK_INTERVAL_SECONDS}"
+
+        check_process > /dev/null 2>&1
+        if [[ "$?" == 0 ]]; then
+            if [[ -n "${CASSANDRA_PID}" ]]; then
+                filed_pid="$(cat "${CASSANDRA_PID}")"
+                if [[ "${PID}" != "${filed_pid}" ]]; then
+                    err "Pid \033[33m${PID}\033[0m is different from \033[33m${filed_pid}\033[0m in ${CASSANDRA_PID}."
+                    return 1
+                fi
+            fi
+
+            start_logs="$(cat "${CASSANDRA_LOG_FILE}" | grep "${START_CHECK_LOG}")"
+            if [[ "$(echo "${start_logs}" | wc -l)" > 0 ]]; then
+                last_start_time="$(date -d "$(echo "${start_logs}" | tail -1 | awk '{print $3,$4}' \
+                    | awk -F ',' '{print $1}')" +%s)"
+                if [[ "${last_start_time}" > "${start_time}" ]]; then
+                    out 'Cassandra is started.'
+                    return 0
+                fi
+            fi
+        fi
+    done
+    local max_start_time
+    max_start_time="$((${START_CHECK_COUNT} * ${START_CHECK_INTERVAL_SECONDS}))"
+    err "Cassandra can not be started in \033[33m${max_start_time}\033[0m seconds."
+    return 1
+}
+
+check_status() {
+    check_process
+    if [[ "$?" != 0 ]]; then
+        return 1
+    fi
+
+    cd "${CASSANDRA_BIN}"
+    local result
+    result="$(./nodetool status | awk '{print $1,$2}')"
+    if [[ -z "${result}" ]]; then
+        err 'Can not get Cassandra status.'
+        return 1
+    fi
+
+    local i
+    i=1
+    local next_word
+    local datacenter
+    local node_status
+    local node_address
+    local abnormal
+    next_word="$(echo ${result} | cut -d ' ' -f "$i")"
+    while [ "${next_word}" != 'Note:' -a "${next_word}" != '' ]; do
+        if [[ "${next_word}" == 'Datacenter:' ]]; then
+            ((i++))
+            datacenter="$(echo ${result} | cut -d ' ' -f "$i")"
+            i="$(($i + 7))"
+            next_word="$(echo ${result} | cut -d ' ' -f "$i")"
+            continue
+        fi
+        node_status="$(echo ${result} | cut -d ' ' -f "$i")"
+        ((i++))
+        node_address="$(echo ${result} | cut -d ' ' -f "$i")"
+        if [[ "${node_status}" == 'Datacenter:' ]]; then
+            next_word="${node_status}"
+            continue
+        fi
+        if [[ "${node_status}" != "UN" ]]; then
+            if [[ -n "${abnormal}" ]]; then
+                abnormal="${abnormal}\n"
+            fi
+            abnormal="${abnormal}${datacenter} node ${node_address} (${node_status}) is not ok."
+        fi
+        ((i++))
+        next_word="$(echo ${result} | cut -d ' ' -f "$i")"
+    done
+    if [[ -n "${abnormal}" ]]; then
+        out "${abnormal}"
+        return 1
+    fi
+
+    ./cqlsh "${NODE}" -e "${DROP_KEYSPACE_CQL}" > /dev/null 2>&1 \
+        && ./cqlsh "${NODE}" -e "${CREATE_KEYSPACE_CQL}" > /dev/null 2>&1 \
+        && ./cqlsh "${NODE}" -e "${DROP_TABLE_CQL}" > /dev/null 2>&1 \
+        && ./cqlsh "${NODE}" -e "${CREATE_TABLE_CQL}" > /dev/null 2>&1 \
+        && ./cqlsh "${NODE}" -e "${INSERT_CQL}" > /dev/null 2>&1 \
+        && ./cqlsh "${NODE}" -e "${SELECT_CQL}" > /dev/null 2>&1 \
+        && ./cqlsh "${NODE}" -e "${DROP_KEYSPACE_CQL}" > /dev/null 2>&1 \
+        && sudo rm -rf "${CASSANDRA_DATA}/data/${TEST_KEYSPACE}"
+    if [[ "$?" != 0 ]]; then
+        out "Cassandra is not ok."
+        return 1
+    else
+        out "Cassandra is ok."
+        return 0
+    fi
+}
+
+confirm_operation() {
+    if [[ "$#" != 2 ]]; then
+        err "Wrong arguments of confirm_operation \033[33m$@\033[0m."
+        return 1
+    fi
+
+    local prompt
+    case "$1" in
+        add)
+            prompt="Do you want to $1 node $2 to ${CLUSTER_NAME} (yes/no)? "
+            ;;
+        remove)
+            prompt="Do you want to $1 node $2 from ${CLUSTER_NAME} (yes/no)? "
+            ;;
+        add_exists)
+            prompt="Do you still want to add node $2 to ${CLUSTER_NAME} even if ${CASSANDRA_HOME} is not empty?"
+            prompt="${prompt} (This may cover the files and settings in that directory.) (yes/no) "
+            ;;
+        *)
+            err "Unexpected operation \033[33$1\033[0m to confirm."
+            return 1
+            ;;
+    esac
+
+    read -p "${prompt}" opt
+    while true; do
+        case "${opt}" in
+            yes)
+                break
+                ;;
+            no)
+                exit 0
+                ;;
+        esac
+        read -p "Please type 'yes' or 'no': " opt
+    done
+    return 0
+}
+
+err() {
+    echo -e "[$(date +"%Y-%m-%d %H:%M:%S")]: $@" >&2
+}
+
+get_local_ip() {
+    local local_ip
+    local_ip="$(ifconfig -a | grep inet | grep -v 'inet6\|127.0.0.1' | awk '{print $2}' | tr -d 'addr:')"
+    if [[ -z "${local_ip}" ]]; then
+        err 'Can not get local ip.'
+        exit 1
+    fi
+    echo "${local_ip}"
+    return 0
+}
+
+out() {
+    echo -e "[$(date +"%Y-%m-%d %H:%M:%S")]: $@"
+}
+
+print_usage() {
+    echo "Usage: $0 {add|backup|remove|restart|restore|start|status|stop}"
+}
+
+remove_node() {
+    check_process
+    if [[ "$?" != 0 ]]; then
+        return 1
+    fi
+
+    confirm_operation "${OPERATION}" "${NODE}"
+
+    cd "${CASSANDRA_BIN}"
+    ./nodetool decommission
+    if  [[ "$?" == 0 ]]; then
+        out "Node ${NODE} is removed from ${CLUSTER_NAME}."
+        return 0
+    else
+        err "Can not remove node \033[33${NODE}\033[0m from ${CLUSTER_NAME}."
+        return 1
+    fi
+
+}
+
+restart_node() {
+    local return_code
+    check_process > /dev/null 2>&1
+    return_code="$?"
+    if [[ "${return_code}" == 1 && -z "${PID}" ]]; then
+        return 1
+    fi
+
+    if [[ "${return_code}" == 0 ]]; then
+        stop_node
+        if [[ "$?" != 0 ]]; then
+            return 1
+        fi
+    fi
+    start_node
+    return "$?"
+}
+
+restore_data() {
+    check_process
+    if [[ "$?" != 0 ]]; then
+        return 1
+    fi
+
+    local restore_source_node
+    restore_source_node="$(echo "${RESTORE_DATA_PACKAGE##*/}" | awk -F '-' '{print $1}')"
+    local keyspace
+    keyspace="$(echo "${RESTORE_DATA_PACKAGE##*/}" | awk -F '-' '{print $2}')"
+    local table
+    table="$(echo "${RESTORE_DATA_PACKAGE##*/}" | awk -F '-' '{print $3}')"
+    local timestamp
+    timestamp="$(echo "${RESTORE_DATA_PACKAGE##*/}" | awk -F '-' '{print $4}')"
+    local current_dir
+    current_dir="$(cd "$(dirname $0)"; pwd)"
+    if [[ -z "${restore_source_node}" || -z "${keyspace}" || -z "${table}" || -z "${timestamp}" ]]; then
+        err "Wrong name format \033[33${RESTORE_DATA_PACKAGE}\033[0m (expect: [node]-[keyspace]-[table]-[time].tar.gz)."
+        return 1
+    fi
+    if [[ ! -d "${keyspace}/${table}" ]]; then
+        mkdir -p "${keyspace}/${table}"
+        if [[ "$?" != 0 ]]; then
+            err "Can not create \033[33${current_dir}/${keyspace}/${table}\033[0m."
+            return 1
+        fi
+    else
+        rm -rf "${keyspace}/${table}/*"
+        if [[ "$?" != 0 ]]; then
+            err "Can not clean \033[33${current_dir}/${keyspace}/${table}\033[0m."
+            return 1
+        fi
+    fi
+
+    tar zxf "${RESTORE_DATA_PACKAGE}" -C "${keyspace}/${table}"
+    if [[ "$?" != 0 ]]; then
+        err "Can not unpack \033[33${RESTORE_DATA_PACKAGE}\033[0m."
+        rm -rf "${keyspace}/${table}"
+        return 1
+    fi
+
+    cd "${CASSANDRA_BIN}"
+    out "Restore ${keyspace}.${table} from ${RESTORE_DATA_PACKAGE}."
+    local return_code
+    ./sstableloader -d "${NODE}" "${current_dir}/${keyspace}/${table}"
+    return_code="$?"
+    if [[ "${return_code}" != 0 ]]; then
+        err "Can not load data from \033[33${RESTORE_DATA_PACKAGE}\033[0m to \033[33${NODE}\033[0m."
+    fi
+    rm -rf "${current_dir}/${keyspace}"
+    if [[ "$?" != 0 ]]; then
+        err "Can not delete \033[33${current_dir}/${keyspace}\033[0m."
+    fi
+    return "${return_code}"
+}
+
+start_node() {
+    check_process
+    if [[ "$?" == 0 ]]; then
+        return 1
+    fi
+
+    start_process
+    check_start
+    return "$?"
+}
+
+start_process() {
+    cd "${CASSANDRA_BIN}"
+    if [[ -n "${CASSANDRA_PID}" ]]; then
+        ./cassandra -p "${CASSANDRA_PID}"
+    else
+        ./cassandra
+    fi
+}
+
+stop_node() {
+    check_process
+    if [[ "$?" != 0 ]]; then
+        return 1
+    fi
+
+    out 'Stop Cassandra process.'
+    kill -9 "${PID}"
+    for ((i=0; i<"${STOP_CHECK_COUNT}"; i++)); do
+        sleep "${STOP_CHECK_INTERVAL_SECONDS}"
+        check_process > /dev/null 2>&1
+        if [[ "$?" != 0 ]]; then
+            out 'Cassandra is stopped.'
+            if [[ -n "${CASSANDRA_PID}" ]]; then
+                cd "${CASSANDRA_BIN}"
+                sudo rm -f "${CASSANDRA_PID}"
+                if [[ "$?" -ne 0 ]]; then
+                    err "Can not delete \033[33m${CASSANDRA_PID}\033[0m."
+                fi
+            fi
+            return 0
+        fi
+    done
+    local max_stop_time
+    max_stop_time="$((${STOP_CHECK_COUNT} * ${STOP_CHECK_INTERVAL_SECONDS}))"
+    err "Cassandra can not be stopped in \033[33m${max_stop_time}\033[0m seconds."
+    return 1
+}
+
+main() {
+    out 'Cassandra operation tool.'
+
+    OPERATION="$1"
+    if [[ -z "${OPERATION}" ]]; then
+        print_usage
+        return 1
+    fi
+    readonly OPERATION
+    shift 1
+
+    NODE="$(get_local_ip)"
+    readonly NODE
+    readonly USER
+
+    case "${OPERATION}" in
+        add)
+            add_node
+            if [[ "$?" != 0 ]]; then
+                check_process > /dev/null 2>&1
+                if [[ "$?" != 0 ]]; then
+                    sudo rm -rf "${CASSANDRA_HOME}"
+                fi
+            fi
+            ;;
+        backup)
+            backup_data
+            ;;
+        remove)
+            remove_node
+            ;;
+        restart)
+            restart_node
+            ;;
+        restore)
+            restore_data
+            ;;
+        start)
+            start_node
+            ;;
+        status)
+            check_status
+            ;;
+        stop)
+            stop_node
+            ;;
+        *)
+            err "Unexpected operation \033[33m${OPERATION}\033[0m."
+            print_usage
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
